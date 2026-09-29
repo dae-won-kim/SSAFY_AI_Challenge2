@@ -4,8 +4,6 @@
 
 **AI Challenge · Team A185** · 2026.09.23 발표
 
-<img src="assets/cover.jpg" alt="AI 척화비 커버 이미지" width="720"/>
-
 이미지 + 질문 + 4지선다(a~d)로 구성된 **이미지 기반 객관식 질의응답(VQA)** 과제에 대해<br/>
 데이터 정제 → 회전 증강 → LoRA 학습 → 로짓 스코어링 추론 → 저신뢰 샘플 Crop 2-pass 재추론으로 이어지는 파이프라인을 구축했습니다.
 
@@ -27,8 +25,6 @@
 
 ## 👥 팀원 소개
 
-| <img src="assets/member_kim_daewon.png" width="120"/> | <img src="assets/member_min_suyoung.png" width="120"/> | <img src="assets/member_kang_minjun.png" width="120"/> | <img src="assets/member_park_seoyoung.png" width="120"/> |
-| :---: | :---: | :---: | :---: |
 | **김대원** | **민수영** | **강민준** | **박서영** |
 | 팀장 | 팀원 | 팀원 | 팀원 |
 | AI 성능 최적화, EDA | AI 구조 파이프라인 설계 | 데이터 전처리 및 증강, EDA | AI 성능 향상, 데이터 EDA |
