@@ -1,0 +1,13 @@
+# PyTorch 는 GPU/CUDA 환경에 맞게 먼저 설치 (예: RTX 50 시리즈는 CUDA 12.8 빌드)
+transformers>=5.16    # Qwen3.5(기본 9B 프리셋)는 5.16 이상 필요 (Qwen3-VL 은 4.57 이상)
+accelerate
+peft
+flash-linear-attention  # Qwen3.5 계열(기본 9B 프리셋)의 linear attention 빠른 커널 (Qwen3-VL 은 쓰지 않음).
+                        # 없으면 Qwen3.5 가 PyTorch 참고 구현으로 돌아 A100 실측 처리량 약 25% 낮고 메모리를 더 씀
+bitsandbytes          # 4bit 프리셋(qwen3.5-9b, qwen2.5-vl-7b)에서만 필요
+huggingface_hub
+pillow
+pandas
+numpy
+tqdm
+# modelscope          # --download-source modelscope 를 쓸 때만
