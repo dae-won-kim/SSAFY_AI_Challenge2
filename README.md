@@ -62,9 +62,311 @@
 
 ## 🧩 Ⅰ. 솔루션 코드 설명
 
-<!-- TODO: 솔루션 코드 설명 작성 예정 (디렉토리 구조, 주요 파일/모듈별 역할 등) -->
+> **한 줄 요약**
+> VLM 하나에 **LoRA 어댑터 하나**만 학습하고, 모든 문항을 **forward 1회의 a/b/c/d 로짓 스코어링**으로 푼 뒤,
+> **불확실한 문항만 골라** 비싼 재추론(Grounding 크롭 · Thinking)을 적용하고, **valid에서 이득이 확인될 때만** 답을 교체하는
+> **5단계 모듈형 파이프라인**입니다.
 
-> 작성 예정
+### 핵심 설계 한눈에 보기
+
+| # | 설계 결정 | 이유 | 구현 위치 |
+| :---: | --- | --- | --- |
+| 1 | **생성 대신 로짓 스코어링** | 답 파싱 실패 0건, 문항당 forward 1회, 확률을 남겨 선별·앙상블에 재활용 | `model_utils.VLM.score` |
+| 2 | **학습 목표 = 추론 방식** | 추론과 같은 프롬프트 끝의 a/b/c/d 4개 로짓에만 Cross-Entropy | `VLM.choice_loss` |
+| 3 | **프롬프트 다양성은 학습 증강으로** | 프롬프트 4종 균등 샘플링 + 30% qtype 힌트 + 선지 순서 셔플 → 추론은 프롬프트 1개로 고정 | `sample_prompt` / `select_prompt` |
+| 4 | **비싼 연산은 불확실한 문항에만** | 정답을 보지 않는 신호(확신도·margin·약한 유형)로 최대 30%만 선별 | `s3_select_rerun.py` |
+| 5 | **교체는 valid로 증명될 때만** | 재추론 방식 × 교체 방법을 valid에서 비교, keep보다 +0.3%p 이상일 때만 채택 | `s5_build_final.py` |
+| 6 | **누수 없는 검증셋** | 원본·회전본·중복 사진을 **이미지 그룹**으로 묶어 그룹 단위 holdout + 지문(hash) 검증 | `data_utils.load_data` |
+| 7 | **끊겨도 이어지는 학습** | 원자적 폴더 교체 + RNG까지 저장하는 체크포인트 + 데이터 지문 검사 | `s1_train_choice_ce.py` |
+| 8 | **CPU / GPU 단계 분리** | 선별·최종 단계는 torch 없이 몇 초 만에 재실행 → 문턱값 튜닝 비용 최소화 | `data_utils` (CPU 전용) |
+| 9 | **설정 한 곳 관리** | seed·LoRA·lr·문턱값을 `config.py` 하나에서 관리, CLI 인자는 일회성 실험용 | `config.py` |
+| 10 | **원격 실험 자동화** | 로컬 터미널에서 Colab VM 할당·실행·감시·회수, VM 2대 병렬 sweep | `colab/` |
+
+---
+
+### 1. 전체 아키텍처
+
+```mermaid
+flowchart LR
+    subgraph DATA["0. 데이터 구축 (data-preprocessing-augmentation/)"]
+        RAW[원본 train 6,714] --> ROT[±30° 회전 2,685]
+        DEV[dev 자동 라벨 601]
+        RAW & ROT & DEV --> BIG[Bigdata_v2<br/>10,000문항]
+    end
+
+    BIG --> S1
+    subgraph GPU1["GPU"]
+        S1["s1 학습<br/>choice-CE LoRA"] -->|adapter/| S2["s2 1-pass 추론<br/>로짓 스코어링"]
+    end
+    S2 -->|"*_pred.csv<br/>p_a..p_d · conf · margin"| S3
+    subgraph CPU1["CPU"]
+        S3["s3 재추론 대상 선별"]
+    end
+    S3 -->|"*_subset.csv"| S4
+    subgraph GPU2["GPU"]
+        S4["s4 선별 문항 재추론<br/>grounding · reason · prompt"]
+    end
+    S4 -->|"*_rerun.csv"| S5
+    S2 -->|submission.csv<br/>기준 제출| OUT
+    subgraph CPU2["CPU"]
+        S5["s5 최종 병합<br/>valid로 교체 방법 선택"]
+    end
+    S5 --> OUT[final_submission.csv]
+```
+
+단계끼리는 **표준 형식의 CSV 파일로만** 주고받습니다(`id, qtype, gold, p_a..p_d, pred, conf, margin`).
+그래서 어느 단계든 단독으로 다시 돌릴 수 있고, 새로운 재추론 방법도 같은 형식의 `*_rerun.csv` 만 만들면 최종 단계에서 그대로 비교됩니다.
+
+---
+
+### 2. 디렉토리 구조
+
+```text
+SSAFY_AI_Challenge2/
+├── config.py                  # 경로·모델 프리셋·실험 설정 (모든 스크립트가 가장 먼저 import)
+├── data_utils.py              # [CPU] 데이터 로드·분할, qtype 분류, 확률 요약, 크롭 좌표, 제출 점검, 결과 저장
+├── model_utils.py             # [GPU] 모델/LoRA 로드, 프롬프트 pool, 로짓 스코어링, grounding, thinking 추론
+├── model_store.py             # 모델 가중치 드라이브 보관소 (Colab VM마다 HF에서 다시 받지 않도록)
+│
+├── s1_train_choice_ce.py      # 1단계: multi-prompt choice-CE LoRA 학습 (이어하기 지원)
+├── s2_predict.py              # 2단계: 문항당 forward 1회 추론 → submission.csv
+├── s3_select_rerun.py         # 3단계: 재추론 대상 선별 (CPU)
+├── s4_rerun_grounding.py      # 4단계: 선별 문항 재추론 (grounding / reason / prompt)
+├── s5_build_final.py          # 최종: valid 비교 후 필요한 행만 교체 (CPU)
+│
+├── ensemble.py                # 따로 학습한 어댑터들의 확률 평균/다수결 (CPU)
+├── probe_batch.py             # 최악 입력 기준 GPU 배치 상한 측정 → config 배치값에 반영
+├── collect_results.py         # 실험별 기록을 합쳐 비교표(summary.csv) 생성
+├── run_pipeline.sh            # 1~최종 단계 순차 실행 (GPU 서버용)
+│
+├── colab/                     # 로컬 터미널 → Colab VM 원격 실행 도구
+│   ├── colab_pipeline.sh      #   VM 할당·코드/데이터 동기화·단계 실행·감시·결과 회수
+│   ├── sweep.sh / sweep.conf  #   VM 여러 대로 실험 병렬 실행
+│   ├── cli_session.py         #   Colab CLI 접속 토큰 만료 문제 우회
+│   └── remote_*.py            #   VM 안에서 실행되는 보조 스크립트 (작업 실행·상태·진행률·평가 조회 등)
+│
+└── data-preprocessing-augmentation/   # 학습 데이터 구축 파이프라인 (별도 패키지)
+    ├── data_pipeline/         #   rotation · degradation · quality · merge · validation · preview
+    └── scripts/               #   01_회전 증강 → 02_열화 증강 → 03_통합(Bigdata_v2)
+```
+
+---
+
+### 3. 모듈 계층 설계
+
+> **결론:** 의존 방향을 `config → data_utils → model_utils → 단계 스크립트` 한 방향으로 고정하고, **torch를 쓰는 코드와 쓰지 않는 코드를 파일 단위로 분리**했습니다.
+
+```text
+           config.py            ← 경로·HF 캐시 환경변수를 transformers import 전에 설정
+               │
+          data_utils.py         ← CPU 전용 (pandas/numpy만). torch를 import하지 않음
+           │         │
+   model_utils.py    │          ← GPU 전용 (torch, transformers, peft)
+     │       │       │
+  s1 s2 s4 probe   s3 s5 ensemble collect_results
+   (GPU 단계)          (CPU 단계: GPU 없이 수 초 만에 재실행)
+```
+
+| 계층 | 책임 | 설계 포인트 |
+| --- | --- | --- |
+| `config.py` | 경로·프리셋·**실험 설정 전부** | `HF_HOME` 은 transformers가 처음 import될 때 한 번만 읽히므로 **반드시 가장 먼저 import**. 데이터 위치는 환경변수 → 현재/상위 폴더 순으로 자동 탐색 |
+| `data_utils.py` | 데이터·평가·파일 입출력 | 3단계·최종 단계·앙상블이 이 모듈만 쓰므로 **GPU 없는 PC에서도 실행** 가능 |
+| `model_utils.py` | 모델·프롬프트·스코어링 | **프롬프트 책임을 한 파일에 모음** — 학습과 추론이 같은 `build_messages()` 를 거치고 프롬프트를 고르는 *정책*만 다름 |
+| `s1`~`s5` | 단계별 진입점 | 각 단계는 앞 단계의 파일(`run.json`, `*_pred.csv`)을 읽어 프리셋·실험 이름·데이터 분할을 이어받음 |
+
+---
+
+### 4. 단계별 상세 설명
+
+#### 0단계 — 학습 데이터 구축 (`data-preprocessing-augmentation/`)
+
+> **결론:** 원본 + 회전 증강 + dev 자동 라벨을 합쳐 **1만 문항의 학습셋(Bigdata_v2)** 을 만들고, 각 단계마다 무결성 검사를 통과해야만 저장합니다.
+
+| 소스 | 파일 이름 규칙 | 문항 수 | 설명 |
+| --- | --- | ---: | --- |
+| 원본 | `orig_train_NNNN.jpg` | 6,714 | 대회 제공 train |
+| 회전 증강 | `rot_train_NNNN_rot{L,R}30.jpg` | 2,685 | 원본 2,427장의 ±30° 회전본 (질문·선지·정답 동일, 빈 모서리는 가장자리 복제) |
+| 자동 라벨 | `auto_dev_NNNN.jpg` | 601 | dev 문항 + 자동 라벨 (보기별 신뢰도 최댓값 ≥ 0.60만) |
+
+- 패키지(`data_pipeline/`)와 실행 스크립트(`scripts/01~03`)를 분리해 로직을 재사용 가능하게 구성했습니다.
+- 실제 촬영 환경을 흉내 내는 **열화 증강 9종**(기울임·렌즈·종이 휨·그림자·저조도·빛반사·블러·저해상도·노이즈 + JPEG)도 구현했으며, 원본 화질 분포를 분석해 강도를 자동 조정하고 너무 망가진 결과는 강도를 낮춰 최대 4회 재시도합니다. (통합본에는 넣지 않은 독립 산출물)
+- 저장 전 검사: 이미지 경로 존재·열림 여부, id 중복, 원본 대비 증강본 수, 질문·정답 보존, 최종 개수·정답 범위.
+
+#### 1단계 — Multi-prompt Choice-CE LoRA 학습 (`s1_train_choice_ce.py`)
+
+> **결론:** 추론과 **똑같은 입력**을 넣고 마지막 위치의 a/b/c/d **4개 로짓에만 CE 손실**을 걸어, 학습 목표와 추론 방식을 정확히 일치시켰습니다.
+
+```python
+# model_utils.VLM.choice_loss (요약)
+texts = [render(build_messages(images, q, choices, prompt)) for ...]   # 추론과 같은 채팅 템플릿
+logits = model(**enc, logits_to_keep=1).logits[:, -1, :]               # 마지막 위치만 계산 (left padding)
+choice_logits = logits[:, letter_ids]                                  # 어휘 전체 → a/b/c/d 4개
+loss = F.cross_entropy(choice_logits, gold, label_smoothing=ls)
+```
+
+**샘플마다 입력을 다르게 (데이터를 복제하지 않는 증강)**
+
+| 요소 | 방법 | 목적 |
+| --- | --- | --- |
+| 프롬프트 표현 | `BASE_PROMPTS` p1~p4 중 균등 샘플링 | 특정 문구에 과적합 방지 → 표현 변화에 강건 |
+| qtype 힌트 | 30% 확률로 유형별 힌트 덧붙임 (부정형·숫자·가격·문구읽기) | 추론 때 힌트가 붙어도/없어도 동작 |
+| 선지 순서 | 매번 무작위 순열 후 정답 인덱스 재계산 | 모델이 **위치가 아니라 내용**을 보도록 (위치 편향 제거) |
+
+**학습 루프 설계**
+
+| 항목 | 설정 | 설명 |
+| --- | --- | --- |
+| LoRA | r=16, alpha=2r, dropout 0.05, 대상 `lm_all` | 언어 모델의 선형층 전부(Qwen3.5의 선형 어텐션 `in_proj_qkv/in_proj_z/out_proj` 포함), 비전 인코더 제외. `lm_all+vision` 등 프리셋을 정규식으로 정의 |
+| 옵티마이저 | AdamW(wd 0.01) + cosine 스케줄(warmup 3%) + grad clip 1.0 | |
+| 배치 | 유효 배치 `grad_accum=8`, 마이크로배치 4 | 결과는 유효 배치가, 속도는 마이크로배치가 결정하도록 분리 |
+| OOM 대응 | OOM 발생 시 **그 마이크로배치만 반으로 쪼개 재귀적으로 재시도** | 긴 학습이 OOM 한 번에 죽지 않음 |
+| Best 선택 | `eval_every=200` 업데이트마다 valid 평가 → **정확도 최고(동률이면 NLL 낮은 쪽)** 어댑터를 `adapter/` 로 | epoch 단위보다 세밀하게 최적 시점 포착 |
+| 이어하기 | 50 업데이트마다 체크포인트 (LoRA + optimizer + scheduler + numpy/torch/CUDA RNG + 진행 위치) | 중단 후 같은 명령으로 재실행하면 같은 순서로 이어서 학습 |
+
+#### 2단계 — 1-pass 로짓 스코어링 추론 (`s2_predict.py`)
+
+> **결론:** 문장을 생성하지 않고 **다음 토큰이 a/b/c/d일 확률 4개만** 계산해, 빠르고 형식 오류가 없으며 이후 단계가 쓸 **확신도 정보를 남깁니다.**
+
+- **left padding**으로 배치의 마지막 위치를 각 문항의 "다음 토큰" 위치로 맞추고, `logits_to_keep=1` 로 마지막 위치 로짓만 계산해 메모리를 절약합니다.
+- 모델 로드 시 **안전 검사** 2가지: ① a/b/c/d가 각각 토큰 1개인지 ② 채팅 템플릿 끝이 `<think>` 로 열려 있지 않은지 (Qwen3.5 thinking 모드 강제 시 오류).
+- 프롬프트는 학습과 달리 **결정적으로 1개만 선택**합니다(`select_prompt`: base `p1` + 해당 qtype 힌트). 프롬프트별 branch 앙상블은 하지 않습니다.
+- 출력: `p_a..p_d`, `pred`, `conf`(1위 확률), `margin`(1·2위 차이), `qtype`, `prompt` + qtype별 정확도 표 + **바로 제출 가능한 `submission.csv`**.
+- `--prompt-scan`: valid에서 base prompt를 하나씩 바꿔 정확도와 **예측 일치율**을 측정하는 진단 도구 (프롬프트 민감도 확인용).
+
+#### 3단계 — 재추론 대상 선별 (`s3_select_rerun.py`, CPU)
+
+> **결론:** **정답을 보지 않는 신호만으로** 불확실한 문항을 고르고, valid에서는 그 규칙이 **오답을 얼마나 잡아내는지**를 수치로 보여줍니다.
+
+| 선별 조건 (하나라도 해당) | 기본값 |
+| --- | --- |
+| 확신도 `conf` < 문턱값 | 0.60 |
+| `margin`(1·2위 차이) < 문턱값 | 0.30 |
+| **약한 qtype** 이면서 `conf` < 문턱값 | 0.90 |
+| 선별 비율 상한 (초과 시 확신도 낮은 순으로 자름) | 30% |
+
+- **약한 qtype은 valid에서 자동 선정**: 전체 정확도보다 5%p 이상 낮고 표본이 20개 이상인 유형.
+- 같은 규칙을 valid와 test에 똑같이 적용하고, valid에서 `선별 문항 정확도 / 비선별 정확도 / 오답 포착률 / 4단계가 다 맞히면 얻을 수 있는 최대 이득`을 출력합니다.
+
+#### 4단계 — 선별 문항 재추론 (`s4_rerun_grounding.py`)
+
+> **결론:** 선별된 문항에만 세 가지 재추론 방식을 적용하고, 결과를 모두 **같은 형식의 CSV**로 남겨 최종 단계가 valid로 고르게 했습니다.
+
+| 모드 | 동작 | 노리는 오답 |
+| --- | --- | --- |
+| **`grounding`** (기본) | ① LoRA를 끈 원본 모델이 "답하려면 봐야 할 영역" bbox(JSON) 생성 → ② **원본 해상도**에서 크롭 → ③ `[전체 사진] + [확대 사진]` 2장으로 재스코어링 | 작은 글자·가격표·간판 읽기 |
+| **`reason`** | Qwen3.5 thinking을 켜고 생각을 먼저 생성(`<think>…</think>`)한 뒤, **바로 답하기와 같은 위치·같은 글자 토큰**의 확률을 읽음 | 부정형("없는 것"), 여러 항목 대조, 지식형 |
+| `prompt` | base prompt를 바꿔 여러 번 풀고 확률 평균 | 프롬프트 표현에 민감한 문항 |
+
+**Grounding 세부 설계**
+
+- bbox 생성은 **LoRA를 끈 원본 모델**(`adapter_off`)로 수행 — 4지선다용 어댑터가 좌표 생성 능력을 해치지 않도록.
+- 모델별 좌표계 차이를 프리셋의 `coord` 로 흡수 (`norm1000`: Qwen3 계열 0~1000 정규화 / `abs`: Qwen2.5-VL 리사이즈 입력 기준 픽셀) → `to_original()` 로 원본 좌표 복원.
+- 크롭 규칙(`crop_region`): 여러 bbox는 합집합(너무 크면 첫 박스) · 여백 15% · 최소 변 15% · 가장자리는 잘라내지 않고 안쪽으로 이동 · **원본의 70% 이상이면 크롭 생략**(1장으로 재추론).
+- bbox 결과는 JSON **캐시**로 저장해 같은 run의 다른 재추론 설정끼리 공유하고, 중간에 끊겨도 이어서 생성합니다.
+- 빨간 박스(모델 bbox)·파란 박스(실제 크롭)를 그린 **확인용 이미지**를 저장해 좌표계 오류를 눈으로 검증합니다.
+
+#### 최종 단계 — 필요한 행만 교체 (`s5_build_final.py`, CPU)
+
+> **결론:** "재추론하면 좋아질 것"이라고 가정하지 않고, **valid에서 keep(교체 안 함)보다 나은 조합만 채택**합니다.
+
+| 방법 | 선별 문항의 최종 확률 |
+| --- | --- |
+| `keep` | 1-pass 그대로 (기준선) |
+| `replace` | 재추론 결과로 전부 교체 |
+| `rule` | 재추론 확신도 ≥ 기본 확신도일 때만 교체 |
+| `blend` | (1−w)·기본 + w·재추론, w ∈ {0.3, 0.5, 0.7} |
+| **`auto`** (기본) | **재추론 방식(grounding·reason) × 위 방법 전부**를 valid로 비교 → keep 대비 **+0.003(약 2문항) 이상**일 때만 채택, 아니면 keep |
+
+선별 문항 수가 적어 우연한 차이로 설정을 바꾸지 않도록 최소 이득(`min_gain`)을 둔 것이 핵심입니다.
+
+#### 보조 도구
+
+| 파일 | 역할 |
+| --- | --- |
+| `ensemble.py` | 따로 학습한 어댑터들의 `test_pred.csv` 를 **재추론 없이** 확률 가중 평균/다수결로 결합, 멤버 간 일치율 리포트 |
+| `probe_batch.py` | 가장 큰 이미지 + 가장 긴 질문·프롬프트로 **최악 입력**을 만들어 학습/1장/2장/bbox 생성의 배치 상한과 처리량 측정 → config 배치값 근거 |
+| `collect_results.py` | 실험별 폴더에 흩어진 `experiments_<단계>.csv` 를 합쳐 `summary.csv`(실험 비교표) 생성 |
+| `model_store.py` | 모델 가중치를 드라이브에 보관하고 새 VM은 드라이브→로컬 복사. 파일별 크기 목록으로 **덜 올라간 사본을 걸러냄** |
+
+---
+
+### 5. 검증셋 설계 — 데이터 누수 방지
+
+> **결론:** 원본과 그 회전본, 바이트가 같은 중복 사진을 **하나의 이미지 그룹**으로 묶고 **그룹 단위로 valid를 떼어**, "같은 사진을 보고 외운 답"으로 valid를 맞히는 누수를 막았습니다.
+
+```text
+train_0001.jpg ─┐
+rot_train_0001_rotL30.jpg ─┼─▶ 그룹 "train_0001"  ──▶ valid로 뽑히면 회전본까지 학습에서 제외
+rot_train_0001_rotR30.jpg ─┘
+바이트가 같은 다른 id 사진 ──▶ Union-Find로 같은 그룹에 병합 (크기가 같은 파일만 md5 비교)
+```
+
+| 설계 | 내용 |
+| --- | --- |
+| 그룹 단위 holdout | 그룹의 10%를 valid로, 그중 **무회전 원본 문항만** valid(671문항) — test와 같은 분포, 깨끗한 사람 라벨 |
+| 결정적 분할 | `md5(split_seed \| 그룹 이름)` 순으로 정렬해 앞 10% 선택 → qtype 규칙·CSV 순서·라이브러리 버전이 바뀌어도 **같은 valid** |
+| 실험 seed와 분리 | `split_seed` 를 `SEED` 와 따로 두어 실험 seed를 바꿔도 valid 고정 → 증강 vs 원본 실험을 **같은 valid로 비교** |
+| 지문 검증 | valid 문항 집합의 hash(`valid_hash`)를 어댑터 폴더의 `train_meta.json` 에 기록 → 2·4단계가 **분할이 달라졌으면 valid 평가를 자동으로 건너뜀** |
+| dev 라벨 신뢰도 | dev 5인 다수결은 라벨 신뢰도가 낮아(EDA 결과) 기본 valid에서 제외, 옵션(`valid_source="dev"`)으로만 지원 |
+
+---
+
+### 6. 안정성 · 재현성 설계
+
+> **결론:** Colab VM이 언제든 끊길 수 있는 환경을 전제로, **어느 순간에 중단돼도 완성본 하나는 남고, 다시 실행하면 같은 상태로 이어지게** 만들었습니다.
+
+| 문제 | 해결 |
+| --- | --- |
+| 어댑터·체크포인트 저장 중 끊김 | `replace_dir`: 임시 폴더에 다 쓴 뒤 교체(이전 것은 `_old` 로 이동 후 삭제) → `path / _tmp / _old` 중 완성본 하나는 항상 남고, 다음 실행 때 `recover_dir` 가 완성 표시 파일로 판별해 복구 |
+| 이어하기 후 다른 결과 | numpy·torch·CUDA RNG 상태와 데이터 순서·위치까지 체크포인트에 저장 → 프롬프트 샘플링·선지 셔플이 같은 순서로 재현 |
+| 설정이 바뀐 체크포인트로 이어하기 | 학습 데이터·valid·평가 문항의 **지문(data_sig)** 과 LoRA 랭크를 비교해 다르면 즉시 중단 (`--fresh` 안내) |
+| 실패한 재추론의 예전 파일이 쓰임 | 4단계 시작 시 예전 결과를 먼저 삭제 → 도중 실패해도 최종 단계가 낡은 파일을 읽지 않음 |
+| 추론 중 OOM | `run_batched`: OOM 난 배치만 1개씩 재시도 |
+| 모델 다운로드 실패 | 이어받기 + 최대 8회 지수 백오프 재시도, `modelscope` 대체 경로 |
+| 제출 파일 오류 | `sample_submission.csv` 와 id 순서·개수 대조, 답이 a~d인지, id 중복, **한 선지 50% 이상 쏠림 경고** |
+
+---
+
+### 7. 실험 관리 · 산출물 구조
+
+> **결론:** 실험 하나의 산출물은 `runs/<run>/` 한 폴더에, 결과 사본은 **하이퍼파라미터가 이름에 담긴 폴더**에 모아 여러 실험을 동시에 돌려도 섞이지 않게 했습니다.
+
+```text
+runs/<run>/                         ← 단계끼리 주고받는 작업 폴더
+├── adapter/  (+ best.json, train_meta.json)
+├── run.json  train_log.csv
+├── valid_pred.csv  test_pred.csv  submission.csv
+├── select/   (valid_subset.csv, test_subset.csv, qtype_report.csv)
+├── rerun/<grounding_adapter | reason>/  (*_rerun.csv, crops/)
+└── final/    (final_submission.csv, valid_compare.csv, final.json)
+
+results/<run>_<preset>_r16_e1_lr1e-4_hint30_aug_s42/   ← 실험 결과 사본 (로컬 + 구글 드라이브 동시 저장)
+```
+
+- 결과 폴더 이름(`config.exp_tag`)에 **run·모델·LoRA 랭크·epoch·lr·힌트 비율·데이터·seed** 가 들어가 파일만 봐도 설정을 알 수 있습니다.
+- 단계별 수치는 `experiments_<단계>.csv` 에 누적하되 **실험마다 파일을 나눠** 여러 VM이 같은 드라이브에 동시에 써도 행이 사라지지 않게 했고, 합치는 일은 로컬의 `collect_results.py` 가 합니다.
+
+---
+
+### 8. 실행 인프라 — 로컬 터미널에서 Colab GPU 원격 제어
+
+> **결론:** 브라우저 노트북 대신 **Colab CLI 기반 셸 도구**를 만들어, 로컬 터미널 명령 한 줄로 VM 할당 → 실행 → 감시 → 결과 회수까지 처리하고 VM 2대로 실험을 병렬 수행했습니다.
+
+```bash
+./colab/colab_pipeline.sh up A100      # VM 할당 + 드라이브 마운트 + 패키지 + 코드·데이터·모델 준비
+./colab/colab_pipeline.sh smoke        # 작은 설정으로 전 단계 점검 (runs_smoke/ 에 분리 저장)
+./colab/colab_pipeline.sh pipeline     # s1 → s2 → s3 → s4(grounding, reason) → s5
+./colab/colab_pipeline.sh fetch        # 결과 회수
+./colab/sweep.sh plan && ./colab/sweep.sh start   # 실험 목록을 VM 2대에 나눠 병렬 실행
+```
+
+| 기능 | 구현 |
+| --- | --- |
+| 백그라운드 작업 | VM 안에서 프로세스로 실행 → 로컬 터미널을 꺼도 계속 진행, 로그는 5분마다 드라이브로 복사 |
+| GPU 자동 배치 | GPU 작업은 빈 GPU를 골라 `CUDA_VISIBLE_DEVICES` 로 고정, 비어 있지 않으면 시작하지 않음 (학습 중복으로 인한 OOM 방지) |
+| 토큰 만료 우회 | Colab CLI가 1시간 뒤 접속 토큰을 갱신하지 않아 세션을 잃는 문제를 발견 → 20분마다 할당 목록 조회로 토큰 갱신(`cli_session.py`), 잃은 세션 재등록(`adopt`) |
+| 데이터 I/O | 데이터는 드라이브에 zip 1개로 두고 VM 로컬 디스크에 풀어 사용 (드라이브에서 이미지 수천 장 직접 읽기 회피) |
+| 병렬 실험 | 계정 동시 할당 한도에 맞춰 `MAX_PARALLEL=2`, 실험이 더 많으면 VM이 자기 몫을 순서대로 이어서 실행 |
 
 ---
 
@@ -181,14 +483,16 @@ python predict.py --data-root <데이터 폴더> --preset qwen3.5-4b --splits te
 
 ### 6. 학습 · 2-pass 재추론 · 병합
 
-<!-- TODO: 학습 / grounding·크롭 재추론 / 결과 병합 스크립트의 실행 명령을 추가해 주세요. -->
-
 | 단계 | 내용 | 명령어 |
 | :---: | --- | --- |
-| 학습 | LoRA 학습 (`VLM(..., train_lora=True)` + `choice_loss`) | `<학습 스크립트>` |
-| 1-pass | `predict.py` 로 전체 예측 + `conf`/`margin` 저장 | 위 4번 참고 |
-| 2-pass | 저신뢰 문항 grounding → 크롭 → [전체+확대] 재추론 | `<재추론 스크립트>` |
-| 병합 | 1-pass 고신뢰 + 2-pass 결과 → `submission.csv` | `<병합 스크립트>` |
+| 학습 | multi-prompt choice-CE LoRA 학습 → `runs/<run>/adapter/` | `python s1_train_choice_ce.py --run main` |
+| 1-pass | 전체 예측 + `conf`/`margin` 저장 → `submission.csv` | `python s2_predict.py --run main` |
+| 선별 | 저신뢰 문항 선별 (CPU) | `python s3_select_rerun.py --run main` |
+| 2-pass | 선별 문항 grounding → 크롭 → [전체+확대] 재추론 / thinking 재추론 | `python s4_rerun_grounding.py --run main --mode grounding --pass2 adapter`<br/>`python s4_rerun_grounding.py --run main --mode reason` |
+| 병합 | valid로 교체 방법 비교 후 필요한 행만 교체 → `final/final_submission.csv` | `python s5_build_final.py --run main --rerun-tag grounding_adapter reason` |
+
+> 전 단계를 한 번에 돌리려면 `./run_pipeline.sh` (GPU 서버) 또는 `./colab/colab_pipeline.sh pipeline` (Colab)을 사용합니다.
+> 처음에는 `--n-train 200 --max-updates 20` 처럼 작은 설정으로 끝까지 도는지 먼저 확인하세요 ([PIPELINE.md](PIPELINE.md) 참고).
 
 ### 7. 자주 나는 문제
 
